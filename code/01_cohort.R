@@ -15,14 +15,10 @@ today = format(Sys.Date(), "%y%m%d")
 
 # data -------------------------------------------------------------------------
 
-## load datasets
-df  = open_dataset(here("../000_data/ohsu/intermediate/medadmin_ohsu"))
-enc = read_parquet(here("../000_data/ohsu/clean/encounters-all_ohsu.parquet"))
-dem = read_parquet(here("../000_data/ohsu/clean/demog_all_240409.parquet"))
+## find CAR-T administrations --------------------------------------------------
 
-## find CAR-T administrations
-df <-
-  df |>
+df =
+  open_dataset(here("../000_data/ohsu/intermediate/medadmin_ohsu")) |>
   dplyr::filter(mar_result %in% c("DUE", "GIVEN", "MISSED", "NEW BAG", "RESTARTED")) |>
   dplyr::select(mrn, enc, admin_dttm, med_nm) |>
   dplyr::collect() |>
@@ -42,10 +38,14 @@ df <-
   fsubset(med_nm != "ONASEMNOGENE ABEPARVOVEC-XIOI 2 X 10EXP13 VG/ML IV SUSPENSION,KIT") |>
   slice_min(admin_dttm, .by = enc)
 
-## add demographics and encounters
-enc <-
-  enc |>
-  select(
+mrns = funique(df$mrn)
+
+## add encounters --------------------------------------------------------------
+
+enc =
+  open_dataset(here("../000_data/ohsu/clean/encounters-all_ohsu.parquet")) |>
+  dplyr::filter(mrn %in% mrns) |>
+  dplyr::select(
     mrn,
     enc,
     age = age_yrs,
@@ -53,19 +53,30 @@ enc <-
     disch_dttm = disch_dttm_enc,
     los_hosp_days,
     dischg_dispo
-  )
+  ) |>
+  dplyr::collect()
 
-df <-
-  df |>
-  left_join(enc) |>
-  left_join(dem |> select(mrn, female_01, race_cat, ethn_cat)) |>
+## add demographics ------------------------------------------------------------
+
+dem =
+  open_dataset(here("../000_data/ohsu/clean/demog_all_240409.parquet")) |>
+  dplyr::filter(mrn %in% mrns) |>
+  dplyr::select(mrn, female_01, race_cat, ethn_cat) |>
+  dplyr::collect()
+
+df =
+  left_join(df, enc) |>
+  left_join(dem) |>
   fsubset(!is.na(age))
+
+rm(enc, dem)
+gc()
 
 # cleanup ----------------------------------------------------------------------
 
 ## clean product names ---------------------------------------------------------
 
-df <-
+df =
   df |>
   fmutate(
     product_cat = case_when(
@@ -88,7 +99,7 @@ df <-
 
 ## time of day -----------------------------------------------------------------
 
-df <-
+df =
   df |>
   fmutate(
     tod_hrs = lubridate::hour(admin_dttm),
@@ -100,6 +111,25 @@ df <-
     tod_late_01  = if_else(tod_hrs == "14:00-20:00", 1L, 0L)
   )
 
+# chart review -----------------------------------------------------------------
+
+## ICANS and CRS not available in OHSU flowsheets, must be chart reviewed
+select(df, mrn, admit_dttm) |> funique() |> fwrite(here("misc", "for_charts.csv"))
+
+charts =
+  readxl::read_xlsx(here("misc", "crs_icans.xlsx")) |>
+  ## fix time variable
+  fmutate(time = paste())
+## tally up scores
+
+# outcomes ---------------------------------------------------------------------
+
+
+
+ddt = lubridate::ymd(death_date),
+d90 = if_else(ddt > time + lubridate::ddays(90) | is.na(ddt), 0L, 1L)
+
+
 ## confounders -----------------------------------------------------------------
 
 df <-
@@ -109,11 +139,4 @@ df <-
     year         = lubridate::year(admin_dttm)
   )
 
-## outcomes --------------------------------------------------------------------
-
-### for chart review
-select(df, mrn, admit_dttm) |> funique() |> fwrite(here("misc", "for_charts.csv"))
-
-ddt = lubridate::ymd(death_date),
-d90 = if_else(ddt > time + lubridate::ddays(90) | is.na(ddt), 0L, 1L)
 
