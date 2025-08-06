@@ -1,4 +1,3 @@
-
 # setup ------------------------------------------------------------------------
 
 ## libraries -------------------------------------------------------------------
@@ -42,10 +41,9 @@ df_main_90 =
     )
   )
 
-df_main_365 = fsubset(df_main_90, admin_date <= as.Date("2024-04-01"))
+df_main_365 = fsubset(df_main_90, admin_dttm < as.POSIXct("2024-07-01"))
 
-rm(files, dates, latest)
-gc()
+rm(files, dates, latest); gc()
 
 # model fitting ----------------------------------------------------------------
 
@@ -88,7 +86,8 @@ covariates = c(
   "outpt_01",
   "los_pre_cart",
   "year_cat",
-  "season"
+  "season",
+  "ldh"
 )
 
 ## fit models ------------------------------------------------------------------
@@ -111,9 +110,9 @@ for (e in exposure_vars) {
 ### template -------------------------------------------------------------------
 
 tpl                 = model.frame(m_os_90_precise)[1, ]
-tpl$e_hours_precise = 8
+tpl$e_hours_precise = 1
 tpl$hospital        = NA
-hours               = seq(8, 15, by = 1)
+hours               = seq(8, 16, by = 1)
 crit                = qnorm(0.975)
 
 newdata =
@@ -173,6 +172,159 @@ arr_os90 =
   )
 
 arr_os90
+
+# ARR for 90-day EFS ----------------------------------------------------------------------
+
+### template -------------------------------------------------------------------
+
+tpl                 = model.frame(m_efs_90_precise)[1, ]
+tpl$e_hours_precise = 1
+tpl$hospital        = NA
+hours               = seq(8, 16, by = 1)
+crit                = qnorm(0.975)
+
+newdata =
+  bind_rows(
+    lapply(hours, function(h) {
+      row = tpl
+      row$e_hours_precise = h
+      row
+    })
+  ) |>
+  fmutate(Hour = hours)
+
+### make predictions -----------------------------------------------------------
+
+pred_link =
+  predict(
+    m_efs_90_precise,
+    newdata = newdata,
+    type    = "link",
+    se.fit  = T,
+    re.form = NA
+  )
+
+preds =
+  newdata |>
+  fmutate(
+    fit_link  = pred_link$fit,
+    se_link   = pred_link$se.fit,
+    prob      = plogis(fit_link),
+    prob_lo   = plogis(fit_link - crit*se_link),
+    prob_hi   = plogis(fit_link + crit*se_link)
+  )
+
+### arr vs baseline (0800) -----------------------------------------------------
+
+baseline = preds |> fsubset(Hour == 8) |> pull(prob)
+preds    = preds |> fmutate(ARR = prob-baseline)
+mean_arr = fmean(preds$ARR)
+
+### bootstrap CI ---------------------------------------------------------------
+
+set.seed(2025)
+
+arr_boot =
+  replicate(1000, {
+    sample_rows = sample(nrow(preds), replace = T)
+    fmean(preds$ARR[sample_rows])
+  })
+
+ci_arr = quantile(arr_boot, c(0.025, 0.975), na.rm = T)
+
+arr_efs90 =
+  tidytable(
+    arr_mean = mean_arr,
+    ci_lo    = ci_arr[1],
+    ci_hi    = ci_arr[2]
+  )
+
+arr_efs90
+
+# leave one out sensitivity analysis -------------------------------------------
+
+## helper: fit model + tidy output ---------------------------------------------
+
+fn_lr_adj = function(data, exposure_var, outcome_var, covariate_vars, use_random = TRUE) {
+  f  = paste0(
+    outcome_var, " ~ ", exposure_var, " + ",
+    paste(covariate_vars, collapse = " + "),
+    if (use_random) " + (1 | hospital)" else ""
+  )
+
+  m = glmer(formula = as.formula(f), data = data, family = binomial)
+
+  broom.mixed::tidy(m, conf.int = TRUE, exponentiate = TRUE) |>
+    fsubset(term == exposure_var) |>
+    fmutate(
+      exposure = exposure_var,
+      outcome  = outcome_var
+    )
+}
+
+## add hour groups ------------------------------------------------------------
+
+df_main_90 = df_main_90 |>
+  mutate(
+    hour_group_precise = floor(e_hours_precise),
+    hour_group_sunrise = floor(e_hours_sunrise)
+  )
+
+## define covariates used in pipeline -----------------------------------------
+
+covs = covariates
+
+## leave-one-hour-out: precise ------------------------------------------------
+
+hour_results_precise = map_dfr(
+  unique(df_main_90$hour_group_precise),
+  function(g) {
+    df_sub = df_main_90 |> filter(hour_group_precise != g)
+
+    fn_lr_adj(
+      data           = df_sub,
+      exposure_var   = "e_hours_precise",
+      outcome_var    = "o_os_90",
+      covariate_vars = covs,
+      use_random     = TRUE
+    ) |>
+      mutate(left_out_hour = g)
+  }
+)
+
+## leave-one-hour-out: sunrise ------------------------------------------------
+
+hour_results_sunrise = map_dfr(
+  unique(df_main_90$hour_group_sunrise),
+  function(g) {
+    df_sub = df_main_90 |> filter(hour_group_sunrise != g)
+
+    fn_lr_adj(
+      data           = df_sub,
+      exposure_var   = "e_hours_sunrise",
+      outcome_var    = "o_os_90",
+      covariate_vars = covs,
+      use_random     = TRUE
+    ) |>
+      mutate(left_out_hour = g)
+  }
+)
+
+## combine and order ----------------------------------------------------------
+
+hour_results =
+  rowbind(hour_results_precise, hour_results_sunrise) |>
+  roworder(exposure, left_out_hour) |>
+  select(
+    exposure,
+    left_out_hour,
+    aor   = estimate,
+    ci_lo = conf.low,
+    ci_hi = conf.high,
+    p_val = p.value
+  )
+
+fwrite(hour_results, here("output", paste0("leave_one_out_", today, ".csv")))
 
 # marginal effects plots -------------------------------------------------------
 
@@ -312,6 +464,8 @@ pval_comp =
 
 ### plot survival outcomes -----------------------------------------------------
 
+#### all survival, faceted -----------------------------------------------------
+
 me_surv =
   ggplot(preds_surv, aes(x = time, y = prob)) +
   geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.2) +
@@ -331,6 +485,132 @@ me_surv
 
 ggsave(
   here("figures", paste0("marginal_effects_surv_", today, ".pdf")),
+  height = 11,
+  width  = 08,
+  units  = "in",
+  dpi    = 600
+)
+
+#### figure 1c, 90-day OS (sunrise) --------------------------------------------
+
+pval_c =
+  fsubset(pval_surv, exposure == "Hours Since Sunrise") |>
+  fsubset(outcome == "90-Day Overall Survival")
+
+c =
+  fsubset(preds_surv, exposure == "Hours Since Sunrise") |>
+  fsubset(outcome == "90-Day Overall Survival") |>
+  ggplot(aes(x = time, y = prob)) +
+  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.2) +
+  geom_line() +
+  geom_text(
+    data  = pval_c, aes(x = x, y = y, label = lab),
+    hjust = -0.1,
+    vjust = 1.1,
+    size  = 3
+  ) +
+  labs(x = "Time", y = "Adjusted Probability of Outcome") +
+  theme_bw(base_size = 10) +
+  theme(strip.text = element_text(face = "bold"))
+
+ggsave(
+  here("figures", paste0("01c_marginal_effects_os90_sunrise_", today, ".pdf")),
+  height = 11,
+  width  = 08,
+  units  = "in",
+  dpi    = 600
+)
+
+#### figure 1d, 90-day EFS (sunrise) -------------------------------------------
+
+pval_d =
+  fsubset(pval_surv, exposure == "Hours Since Sunrise") |>
+  fsubset(outcome == "90-Day Event-Free Survival")
+
+d =
+  fsubset(preds_surv, exposure == "Hours Since Sunrise") |>
+  fsubset(outcome == "90-Day Event-Free Survival") |>
+  ggplot(aes(x = time, y = prob)) +
+  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.2) +
+  geom_line() +
+  geom_text(
+    data  = pval_d, aes(x = x, y = y, label = lab),
+    hjust = -0.1,
+    vjust = 1.1,
+    size  = 3
+  ) +
+  labs(x = "Time", y = "Adjusted Probability of Outcome") +
+  theme_bw(base_size = 10) +
+  theme(strip.text = element_text(face = "bold"))
+
+d
+
+ggsave(
+  here("figures", paste0("01d_marginal_effects_efs90_sunrise_", today, ".pdf")),
+  height = 11,
+  width  = 08,
+  units  = "in",
+  dpi    = 600
+)
+
+#### figure e2, 90-day outcomes (clock time) -----------------------------------
+
+p2 =
+  fsubset(pval_surv, exposure == "Hour of Day") |>
+  fsubset(outcome %in% c("90-Day Event-Free Survival", "90-Day Overall Survival"))
+
+f2e =
+  fsubset(preds_surv, exposure == "Hour of Day") |>
+  fsubset(outcome %in% c("90-Day Event-Free Survival", "90-Day Overall Survival")) |>
+  ggplot(aes(x = time, y = prob)) +
+  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.2) +
+  geom_line() +
+  geom_text(
+    data  = p2, aes(x = x, y = y, label = lab),
+    hjust = -0.1,
+    vjust = 1.1,
+    size  = 3
+  ) +
+  facet_grid(rows = vars(outcome), cols = vars(exposure), scales = "free_x") +
+  labs(x = "Time", y = "Adjusted Probability of Outcome") +
+  theme_bw(base_size = 10) +
+  theme(strip.text = element_text(face = "bold"))
+
+f2e
+
+ggsave(
+  here("figures", paste0("s02_marginal_effects_d90_", today, ".pdf")),
+  height = 11,
+  width  = 08,
+  units  = "in",
+  dpi    = 600
+)
+
+#### figure e3, 365-day outcomes (all times) -----------------------------------
+
+p3 =
+  fsubset(pval_surv, !outcome %in% c("90-Day Event-Free Survival", "90-Day Overall Survival"))
+
+f3e =
+  fsubset(preds_surv, !outcome %in% c("90-Day Event-Free Survival", "90-Day Overall Survival")) |>
+  ggplot(aes(x = time, y = prob)) +
+  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.2) +
+  geom_line() +
+  geom_text(
+    data  = p3, aes(x = x, y = y, label = lab),
+    hjust = -0.1,
+    vjust = 1.1,
+    size  = 3
+  ) +
+  facet_grid(rows = vars(outcome), cols = vars(exposure), scales = "free_x") +
+  labs(x = "Time", y = "Adjusted Probability of Outcome") +
+  theme_bw(base_size = 10) +
+  theme(strip.text = element_text(face = "bold"))
+
+f3e
+
+ggsave(
+  here("figures", paste0("s03_marginal_effects_d365_", today, ".pdf")),
   height = 11,
   width  = 08,
   units  = "in",
@@ -363,50 +643,6 @@ ggsave(
   units  = "in",
   dpi    = 600
 )
-
-# plot 90-day OS individually for Figure 1 -------------------------------------
-
-p_value =
-  fsubset(preds_surv, outcome == "90-Day Overall Survival" & exposure == "Hour of Day") |>
-  pull(p_value) |>
-  funique()
-
-figure_1b =
-  fsubset(preds_surv, outcome == "90-Day Overall Survival" & exposure == "Hour of Day") |>
-  ggplot(aes(x = time, y = prob)) +
-  geom_line(size = 1.25, color = "black") +
-  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), fill = "black", alpha = 0.15) +
-  annotate(
-    "text",
-    x      = 8,
-    y      = 0.22,
-    label  = paste0("p = ", signif(p_value, 2)),
-    hjust  = 0,
-    vjust  = 1,
-    fontface = "bold"
-  ) +
-  scale_x_continuous(limits = c(7, 18), breaks = seq(8, 18, 1)) +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-  coord_cartesian(xlim = c(8, 17), ylim = c(0.2, 1)) +
-  labs(
-    x     = "Infusion Time of Day (Hours)",
-    y     = "Adjusted 90-Day Overall Survival",
-    title = "B. Adjusted 90-Day Overall Survival"
-  ) +
-  theme_bw(base_size = 14)
-
-figure_1b
-
-ggsave(
-  here("figures", paste0("01b_marginal_surv90_tod_", today, ".pdf")),
-  width  = 8,
-  height = 8,
-  units  = "in",
-  dpi    = 600
-)
-
-rm(figure_1b, p_value, pval_surv, pval_comp)
-gc()
 
 # save odds ratios and e-values for tables/figures -----------------------------
 
@@ -457,7 +693,7 @@ for (i in seq_along(model_names)) {
     next
   }
 
-## compile ORs and E-values ----------------------------------------------------
+  ## compile ORs and E-values ----------------------------------------------------
 
   aor     = exposure_row$estimate
   ci_lo   = exposure_row$conf.low
